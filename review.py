@@ -1,10 +1,40 @@
 import os
 import json
+import time
 import requests
 from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# -------------------------
+# Configuration
+# -------------------------
+
+# File extensions to skip (binary files, generated code, etc.)
+SKIP_EXTENSIONS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.webp',
+    '.pdf', '.zip', '.tar', '.gz', '.tgz', '.rar',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.obj',
+    '.pyc', '.pyo', '.pyd', '.class', '.jar', '.war', '.ear',
+    '.o', '.a', '.lib', '.dll', '.so', '.dylib',
+    '.mo', '.pot', '.db', '.sqlite', '.sqlite3',
+    '.woff', '.woff2', '.ttf', '.eot',
+}
+
+# Directory patterns to skip
+SKIP_DIRS = {
+    'node_modules', 'dist', 'build', '.git', 'vendor', 'Pods',
+    '.gradle', 'target', '__pycache__', '.venv', 'venv', 'env',
+    'bin', 'obj', '.idea', '.vscode', '.cache',
+}
+
+# Max number of comments to post (safety limit)
+MAX_COMMENTS_PER_PR = 50
+
+# GitHub API rate limit retry settings
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # seconds (will be multiplied: 2, 4, 8)
 
 # -------------------------
 # Config (Auto injected by GitHub Actions)
@@ -19,6 +49,68 @@ headers = {
     "Authorization": f"token {GITHUB_TOKEN}",
     "Accept": "application/vnd.github+json"
 }
+
+# -------------------------
+# Helper Functions
+# -------------------------
+
+def should_skip_file(filename):
+    """Check if a file should be skipped based on extension or directory."""
+    # Check extension
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in SKIP_EXTENSIONS:
+        return True
+
+    # Check if any skip directory is in the path
+    path_parts = filename.split('/')
+    for part in path_parts:
+        if part in SKIP_DIRS:
+            return True
+
+    # Skip common generated/minified patterns
+    basename = os.path.basename(filename).lower()
+    if any(pattern in basename for pattern in ['min.', '.min.', 'bundle.']):
+        return True
+
+    return False
+
+def make_github_request(url, params=None):
+    """Make a request to GitHub API with rate limit handling and retry."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.get(url, headers=headers, params=params)
+
+            if response.status_code == 200:
+                return response
+
+            # Handle rate limiting
+            if response.status_code in (403, 429):
+                remaining = response.headers.get('X-RateLimit-Remaining', '1')
+                reset_time = response.headers.get('X-RateLimit-Reset')
+
+                if remaining == '0' or response.status_code == 429:
+                    wait_time = RETRY_DELAY * (2 ** attempt)  # Exponential backoff
+                    if reset_time:
+                        # GitHub provides Unix timestamp when rate limit resets
+                        reset_epoch = int(reset_time)
+                        current_time = int(time.time())
+                        wait_time = max(reset_epoch - current_time + 1, wait_time)
+
+                    print(f"Rate limit hit (attempt {attempt + 1}/{MAX_RETRIES}). Waiting {wait_time}s...")
+                    time.sleep(wait_time)
+                    continue
+
+            # Other errors
+            response.raise_for_status()
+
+        except requests.exceptions.RequestException as e:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            wait_time = RETRY_DELAY * (2 ** attempt)
+            print(f"Request failed: {e}. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+
+    raise Exception(f"Failed after {MAX_RETRIES} retries")
 
 # -------------------------
 # Load PR metadata
@@ -38,10 +130,26 @@ print(f"Reviewing PR #{pr_number}")
 
 files_url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}/files"
 
-response = requests.get(files_url, headers=headers)
-files = response.json()
+try:
+    response = make_github_request(files_url)
+    files = response.json()
+except Exception as e:
+    print(f"Failed to fetch files from GitHub: {e}")
+    exit(1)
 
-print(f"{len(files)} files changed")
+# Filter files before review
+filtered_files = []
+skipped_count = 0
+for file in files:
+    filename = file["filename"]
+    if should_skip_file(filename):
+        skipped_count += 1
+        print(f"Skipping {filename} (filtered)")
+        continue
+    filtered_files.append(file)
+
+total_files = len(filtered_files)
+print(f"{total_files} files to review (skipped {skipped_count})")
 
 # -------------------------
 # Review each file
@@ -49,7 +157,7 @@ print(f"{len(files)} files changed")
 
 comments = []
 
-for file in files:
+for file in filtered_files:
 
     filename = file["filename"]
 
