@@ -37,20 +37,6 @@ MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds (will be multiplied: 2, 4, 8)
 
 # -------------------------
-# Config (Auto injected by GitHub Actions)
-# -------------------------
-GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
-REPO = os.environ["GITHUB_REPOSITORY"]
-EVENT_PATH = os.environ["GITHUB_EVENT_PATH"]
-
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-
-headers = {
-    "Authorization": f"token {GITHUB_TOKEN}",
-    "Accept": "application/vnd.github+json"
-}
-
-# -------------------------
 # Helper Functions
 # -------------------------
 
@@ -74,7 +60,7 @@ def should_skip_file(filename):
 
     return False
 
-def make_github_request(url, params=None):
+def make_github_request(url, headers, params=None):
     """Make a request to GitHub API with rate limit handling and retry."""
     for attempt in range(MAX_RETRIES):
         try:
@@ -113,62 +99,81 @@ def make_github_request(url, params=None):
     raise Exception(f"Failed after {MAX_RETRIES} retries")
 
 # -------------------------
-# Load PR metadata
+# Main Review Function
 # -------------------------
 
-with open(EVENT_PATH) as f:
-    event = json.load(f)
+def process_review(repo: str, pr_number: int, installation_id: int):
+    """
+    Process a PR review using GitHub App authentication.
 
-pr_number = event["pull_request"]["number"]
-commit_id = event["pull_request"]["head"]["sha"]
+    Args:
+        repo: Repository name (e.g., "owner/repo")
+        pr_number: Pull request number
+        installation_id: GitHub App installation ID
+    """
+    from github_app import GitHubAppAuth
 
-print(f"Reviewing PR #{pr_number}")
+    print(f"Reviewing PR #{pr_number} in {repo}")
 
-# -------------------------
-# Get changed files
-# -------------------------
+    # Get GitHub App auth token
+    auth = GitHubAppAuth(
+        app_id=os.environ["GITHUB_APP_ID"],
+        private_key_path=os.environ["GITHUB_PRIVATE_KEY_PATH"],
+        installation_id=installation_id
+    )
+    token = auth.get_installation_token()
 
-files_url = f"https://api.github.com/repos/{REPO}/pulls/{pr_number}/files"
+    # Setup headers with installation token
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json"
+    }
 
-try:
-    response = make_github_request(files_url)
-    files = response.json()
-except Exception as e:
-    print(f"Failed to fetch files from GitHub: {e}")
-    exit(1)
+    # -------------------------
+    # Get changed files
+    # -------------------------
 
-# Filter files before review
-filtered_files = []
-skipped_count = 0
-for file in files:
-    filename = file["filename"]
-    if should_skip_file(filename):
-        skipped_count += 1
-        print(f"Skipping {filename} (filtered)")
-        continue
-    filtered_files.append(file)
+    files_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/files"
 
-total_files = len(filtered_files)
-print(f"{total_files} files to review (skipped {skipped_count})")
+    try:
+        response = make_github_request(files_url, headers)
+        files = response.json()
+    except Exception as e:
+        print(f"Failed to fetch files from GitHub: {e}")
+        return
 
-# -------------------------
-# Review each file
-# -------------------------
+    # Filter files before review
+    filtered_files = []
+    skipped_count = 0
+    for file in files:
+        filename = file["filename"]
+        if should_skip_file(filename):
+            skipped_count += 1
+            print(f"Skipping {filename} (filtered)")
+            continue
+        filtered_files.append(file)
 
-comments = []
+    total_files = len(filtered_files)
+    print(f"{total_files} files to review (skipped {skipped_count})")
 
-for file in filtered_files:
+    # -------------------------
+    # Review each file
+    # -------------------------
 
-    filename = file["filename"]
+    comments = []
+    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
-    if "patch" not in file:
-        continue
+    for file in filtered_files:
+        filename = file["filename"]
 
-    patch = file["patch"]
+        if "patch" not in file:
+            continue
 
-    print(f"Reviewing {filename}")
+        patch = file["patch"]
 
-    prompt = f"""
+        print(f"Reviewing {filename}")
+
+        prompt = f"""
 You are a senior software engineer reviewing a pull request.
 
 Review the following git diff for bugs, security issues, or bad practices.
@@ -194,50 +199,60 @@ If there are no issues, return:
 {{ "comments": [] }}
 """
 
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "You are a senior software engineer with extreme technical expertise."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0
+            )
+
+            result = response.choices[0].message.content
+            data = json.loads(result)
+
+            for c in data["comments"]:
+                comments.append({
+                    "path": filename,
+                    "line": c["line"],
+                    "body": c["message"]
+                })
+
+        except Exception as e:
+            print(f"LLM review failed for {filename}: {e}")
+
+    # -------------------------
+    # Get commit SHA
+    # -------------------------
+
+    pr_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
     try:
-        response = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": "You are a senior software engineer with extreme technical expertise."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0
-        )
-
-        result = response.choices[0].message.content
-
-        data = json.loads(result)
-
-        for c in data["comments"]:
-            comments.append({
-                "path": filename,
-                "line": c["line"],
-                "body": c["message"]
-            })
-
+        pr_data = make_github_request(pr_url, headers).json()
+        commit_id = pr_data["head"]["sha"]
     except Exception as e:
-        print(f"LLM review failed for {filename}: {e}")
+        print(f"Failed to fetch PR data: {e}")
+        return
 
+    # -------------------------
+    # Post comments to PR
+    # -------------------------
 
-# -------------------------
-# Post comments to PR
-# -------------------------
+    for comment in comments:
+        print(f"Comment on {comment['path']}:{comment['line']}: {comment['body']}")
 
+        comment_url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}/comments"
+        payload = {
+            "body": comment["body"],
+            "commit_id": commit_id,
+            "path": comment["path"],
+            "line": comment["line"]
+        }
 
-for comment in comments:
-    print(f"Comment on {comment['path']}:{comment['line']}: {comment['body']}")
-    continue
+        try:
+            response = requests.post(comment_url, headers=headers, json=payload)
+            response.raise_for_status()
+        except Exception as e:
+            print(f"Failed to post comment: {e}")
 
-    """
-    Right now we are just printing the comments to avoid spamming the PR with comments.
-    TODO: Post comments to PR
-    Use url https://api.github.com/repos/{REPO}/pulls/{pr_number}/comments with payload:
-    {
-        "body": body,
-        "commit_id": commit_id,
-        "path": path,
-        "line": line
-    }
-    """
-
-print("Review complete.")
+    print(f"Review complete: {len(comments)} comments posted.")
