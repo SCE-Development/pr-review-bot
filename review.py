@@ -40,6 +40,43 @@ RETRY_DELAY = 2  # seconds (will be multiplied: 2, 4, 8)
 # Helper Functions
 # -------------------------
 
+def clean_and_parse_json(text: str):
+    """Clean LLM response and parse JSON, removing markdown fences and extracting the first JSON object."""
+    if not text:
+        raise ValueError("Empty response")
+
+    cleaned = text.strip()
+
+    # Remove markdown code fences (```json ... ``` or ``` ... ```)
+    if cleaned.startswith("```"):
+        lines = cleaned.split('\n')
+        # Skip first line if it's a fence
+        if lines[0].strip().startswith("```"):
+            lines = lines[1:]
+        # Remove last line if it's a closing fence
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = '\n'.join(lines).strip()
+
+    # Try direct parse first
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass  # Continue to brace extraction
+
+    # Find the first '{' and last '}' to extract a JSON object
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        candidate = cleaned[start:end+1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    # If we get here, parsing failed
+    raise ValueError(f"Could not extract valid JSON from response (first 200 chars): {text[:200]}...")
+
 def should_skip_file(filename):
     """Check if a file should be skipped based on extension or directory."""
     # Check extension
@@ -189,6 +226,7 @@ Return JSON in this format:
   "comments": [
     {{
       "line": <line number>,
+      "severity": "<critical|high|medium|low>",
       "message": "<review comment>"
     }}
   ]
@@ -197,6 +235,8 @@ Return JSON in this format:
 If there are no issues, return:
 
 {{ "comments": [] }}
+
+IMPORTANT: Return ONLY valid JSON. Do not include any other text, explanations, or markdown formatting (such as ```json code fences```).
 """
 
         try:
@@ -210,17 +250,121 @@ If there are no issues, return:
             )
 
             result = response.choices[0].message.content
-            data = json.loads(result)
+            try:
+                data = clean_and_parse_json(result)
+            except Exception as e:
+                print(f"Failed to parse LLM response for {filename}: {e}")
+                continue
 
             for c in data["comments"]:
                 comments.append({
                     "path": filename,
                     "line": c["line"],
+                    "severity": c.get("severity", "medium"),
                     "body": c["message"]
                 })
 
         except Exception as e:
             print(f"LLM review failed for {filename}: {e}")
+
+    # Second pass: Consolidate and prioritize all comments (max 5 total)
+    all_file_comments = comments  # Save all collected comments
+    print(f"\nCollected {len(all_file_comments)} potential issues. Consolidating to max {MAX_COMMENTS_PER_PR}...")
+
+    comments = []
+    if all_file_comments:
+        # Build a summary of all issues for prioritization
+        issues_summary = ""
+        for idx, comment in enumerate(all_file_comments, 1):
+            issues_summary += f"{idx}. [{comment['severity'].upper()}] {comment['path']}:{comment['line']} - {comment['body'][:100]}...\n"
+
+        consolidation_prompt = f"""
+You are a senior software engineer conducting a final PR review.
+
+The following potential issues were identified across all files:
+
+{issues_summary}
+
+Select at most {MAX_COMMENTS_PER_PR} of the MOST CRITICAL issues to actually comment on.
+
+IMPORTANT RULES:
+- Prioritize critical and high severity issues first
+- Skip low-severity issues (style, nitpicks) unless there's something really important
+- If multiple issues are related, consider if they can be combined into a single comment
+- Be conservative - it's better to have fewer, more impactful comments than many minor ones
+- **You MUST include at least one comment (either a selected issue or a summary comment), even if the code looks perfect.** If no significant issues are found, provide a positive or neutral summary comment like "No significant issues found. The changes look good."
+
+Return JSON in this format:
+
+{{
+  "selected_issues": [
+    {{
+      "original_index": <index from list above>,
+      "comment": {{
+        "line": <line number>,
+        "message": "<final review comment - refine if needed for clarity>"
+      }}
+    }}
+  ],
+  "summary_comment": "<if you want to add general feedback instead of or in addition to specific line comments. This can be used to satisfy the 'at least one comment' rule when there are no issues.>"
+}}
+
+Do NOT return empty strings. Ensure either selected_issues contains at least one item OR summary_comment is non-empty.
+
+IMPORTANT: Return ONLY valid JSON. Do not include any other text, explanations, or markdown formatting.
+"""
+
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": "You are a senior software engineer with extreme technical expertise."},
+                    {"role": "user", "content": consolidation_prompt}
+                ],
+                temperature=0
+            )
+
+            result = response.choices[0].message.content
+            try:
+                data = clean_and_parse_json(result)
+            except Exception as e:
+                raise ValueError(f"Consolidation JSON parsing failed: {e}")
+
+            # Add selected specific comments
+            for selected in data["selected_issues"][:MAX_COMMENTS_PER_PR]:
+                idx = selected["original_index"] - 1
+                if 0 <= idx < len(all_file_comments):
+                    original = all_file_comments[idx]
+                    comments.append({
+                        "path": original["path"],
+                        "line": selected["comment"]["line"],
+                        "body": selected["comment"]["message"]
+                    })
+
+            # Optionally add summary comment if present and we have room
+            if data.get("summary_comment") and len(comments) < MAX_COMMENTS_PER_PR:
+                # Summary comments are posted as general PR comments (no line number)
+                comments.append({
+                    "path": None,  # Indicates general PR comment
+                    "line": None,
+                    "body": data["summary_comment"]
+                })
+
+        except Exception as e:
+            print(f"Consolidation failed, falling back to all comments: {e}")
+            # Fallback: just use all comments but respect the limit
+            comments = [
+                {"path": c["path"], "line": c["line"], "body": c["body"]}
+                for c in all_file_comments[:MAX_COMMENTS_PER_PR]
+            ]
+
+    # Ensure at least one comment is posted, even if no issues were found
+    if len(comments) == 0:
+        comments.append({
+            "path": None,
+            "line": None,
+            "body": "Review complete: No significant issues found. The changes look good."
+        })
 
     # -------------------------
     # Get commit SHA
