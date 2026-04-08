@@ -1,5 +1,6 @@
 e2b>=1.0.0
 anthropic>=0.25.0
+openai
 requests
 python-dotenv
 fastapi

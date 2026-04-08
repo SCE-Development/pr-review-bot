@@ -99,11 +99,10 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
 
         # Create E2B sandbox
         print("[E2B] Creating sandbox...")
-        e2b_api_key = os.environ.get("E2B_API_KEY")
-        if not e2b_api_key:
+        if not os.environ.get("E2B_API_KEY"):
             raise ValueError("E2B_API_KEY not set")
 
-        sandbox = Sandbox(api_key=e2b_api_key, template="claude", timeout=600)#id is wunszvjeuyrdgrt0z6o9
+        sandbox = Sandbox(template="claude", timeout=600)
         print("[E2B] Sandbox created")
 
         # Upload agent.py to sandbox
@@ -185,8 +184,19 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
                     response = requests.post(comment_url, headers=headers, json=payload)
                     response.raise_for_status()
                     print(f"[E2B] Posted comment ({label})")
-                except Exception as e:
-                    print(f"[E2B] Failed to post comment ({label}): {e}")
+                except requests.HTTPError as e:
+                    if e.response.status_code == 422 and file_path and line:
+                        # Line not in diff — fall back to general issue comment
+                        print(f"[E2B] Inline comment rejected (line not in diff), posting as issue comment ({label})")
+                        fallback_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+                        fallback_payload = {"body": f"**[{severity.upper()}]** `{file_path}` (line {line}): {message}"}
+                        try:
+                            requests.post(fallback_url, headers=headers, json=fallback_payload).raise_for_status()
+                            print(f"[E2B] Posted fallback comment ({label})")
+                        except Exception as e2:
+                            print(f"[E2B] Failed to post fallback comment: {e2}")
+                    else:
+                        print(f"[E2B] Failed to post comment ({label}): {e}")
 
             if not findings:
                 comment_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
