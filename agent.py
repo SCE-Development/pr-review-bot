@@ -84,7 +84,7 @@ def run_agent(client: Anthropic, pr_diff: str, max_tool_calls: int) -> str:
 
     while True:
         response = client.messages.create(
-            model="claude-haiku-4-5",
+            model="claude-haiku-4-5-20251001",
             max_tokens=4096,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
@@ -94,8 +94,9 @@ def run_agent(client: Anthropic, pr_diff: str, max_tool_calls: int) -> str:
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
+            print(f"end_turn content: {response.content}", file=sys.stderr)
             for block in response.content:
-                if hasattr(block, 'text'):
+                if hasattr(block, 'text') and block.text.strip():
                     return block.text
             return ""
 
@@ -116,14 +117,16 @@ def run_agent(client: Anthropic, pr_diff: str, max_tool_calls: int) -> str:
 
             if tool_call_count >= max_tool_calls:
                 print(f"Tool call limit ({max_tool_calls}) reached, requesting final answer.", file=sys.stderr)
+                messages.append({"role": "user", "content": "You've used the maximum number of tool calls. Based on everything you've seen, provide your final review as JSON now."})
                 response = client.messages.create(
-                    model="claude-haiku-4-5",
+                    model="claude-haiku-4-5-20251001",
                     max_tokens=4096,
                     system=SYSTEM_PROMPT,
                     messages=messages
                 )
+                print(f"Final response stop_reason={response.stop_reason} content={response.content}", file=sys.stderr)
                 for block in response.content:
-                    if hasattr(block, 'text'):
+                    if hasattr(block, 'text') and block.text.strip():
                         return block.text
                 return ""
         else:
@@ -199,10 +202,8 @@ def main():
 
     except json.JSONDecodeError as e:
         print(json.dumps({"error": f"Invalid JSON from agent: {str(e)}", "findings": []}))
-        sys.exit(1)
     except Exception as e:
         print(json.dumps({"error": f"Agent failed: {str(e)}", "findings": []}))
-        sys.exit(1)
 
 
 if __name__ == '__main__':

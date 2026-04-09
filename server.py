@@ -7,7 +7,6 @@ import threading
 import requests
 from e2b import Sandbox
 from github_app import GitHubAppAuth
-from review import process_review
 
 app = FastAPI(title="PR Review Bot")
 WEBHOOK_SECRET = os.environ.get('GITHUB_WEBHOOK_SECRET')
@@ -31,7 +30,7 @@ def verify_signature(request_body: bytes, signature: str) -> bool:
 def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
     """
     Run PR review using E2B sandbox and Anthropic Agent SDK.
-    Falls back to process_review if E2B fails.
+    Runs PR review using E2B sandbox and Anthropic agent.
     """
     print(f"[E2B] Starting review for PR #{pr_number} in {repo}")
 
@@ -40,15 +39,14 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
     try:
         acquired = e2b_semaphore.acquire(blocking=True, timeout=60)
         if not acquired:
-            print("[E2B] Timeout acquiring semaphore, falling back to local review")
-            process_review(repo, pr_number, installation_id)
+            print("[E2B] Timeout acquiring semaphore, skipping review")
             return
     except Exception as e:
-        print(f"[E2B] Semaphore error: {e}, falling back to local review")
-        process_review(repo, pr_number, installation_id)
+        print(f"[E2B] Semaphore error: {e}")
         return
 
     sandbox = None
+    stdout_chunks = []
     try:
         # Get GitHub App auth token
         auth = GitHubAppAuth(
@@ -73,8 +71,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
             commit_sha = pr_data["head"]["sha"]
             branch_name = pr_data["head"]["ref"]
         except Exception as e:
-            print(f"[E2B] Failed to fetch PR data: {e}, falling back to local review")
-            process_review(repo, pr_number, installation_id)
+            print(f"[E2B] Failed to fetch PR data: {e}")
             return
 
         # Get PR diff (unified diff format)
@@ -93,8 +90,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
                     diff_parts.append(file['patch'])
             pr_diff = '\n'.join(diff_parts)
         except Exception as e:
-            print(f"[E2B] Failed to fetch PR diff: {e}, falling back to local review")
-            process_review(repo, pr_number, installation_id)
+            print(f"[E2B] Failed to fetch PR diff: {e}")
             return
 
         # Create E2B sandbox
@@ -102,7 +98,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
         if not os.environ.get("E2B_API_KEY"):
             raise ValueError("E2B_API_KEY not set")
 
-        sandbox = Sandbox(template="claude", timeout=600)
+        sandbox = Sandbox.create(template="claude", timeout=300)
         print("[E2B] Sandbox created")
 
         # Upload agent.py to sandbox
@@ -114,6 +110,11 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
         # Write PR diff to a file to avoid env var size limits for large PRs
         sandbox.files.write('/app/pr.diff', pr_diff)
         print("[E2B] PR diff written to /app/pr.diff")
+
+        # Install dependencies in the sandbox
+        print("[E2B] Installing dependencies...")
+        sandbox.commands.run("pip3 install anthropic -q --break-system-packages", timeout=120)
+        print("[E2B] Dependencies installed")
 
         # Run the agent with env vars passed directly to the command
         print("[E2B] Starting agent process...")
@@ -128,9 +129,9 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
 
         stdout_chunks = []
         sandbox.commands.run(
-            "python /app/agent.py",
+            "python3 /app/agent.py",
             envs=agent_envs,
-            timeout=580,
+            timeout=290,
             on_stdout=lambda data: stdout_chunks.append(data),
             on_stderr=lambda data: print(f"[Agent] {data}", end='', flush=True)
         )
@@ -139,6 +140,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
         print("[E2B] Agent process completed")
 
         # Parse the JSON output
+        print(f"[E2B] Agent stdout: {stdout[:500]}")
         try:
             output = json.loads(stdout)
             findings = output.get('findings', [])
@@ -199,34 +201,25 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
                         print(f"[E2B] Failed to post comment ({label}): {e}")
 
             if not findings:
-                comment_url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
-                payload = {"body": "Review complete: No significant issues found. The changes look good."}
-                try:
-                    response = requests.post(comment_url, headers=headers, json=payload)
-                    response.raise_for_status()
-                    print("[E2B] Posted summary comment")
-                except Exception as e:
-                    print(f"[E2B] Failed to post summary comment: {e}")
+                print("[E2B] No findings, skipping comment")
 
         except json.JSONDecodeError as e:
             print(f"[E2B] Failed to parse agent output: {e}")
             print(f"[E2B] Agent output (first 500 chars): {stdout[:500]}")
-            print("[E2B] Falling back to local review")
-            process_review(repo, pr_number, installation_id)
 
     except Exception as e:
         print(f"[E2B] Error during review: {e}")
-        print("[E2B] Falling back to local review")
-        process_review(repo, pr_number, installation_id)
+        if stdout_chunks:
+            print(f"[E2B] Agent stdout: {''.join(stdout_chunks)}")
 
     finally:
         # Ensure sandbox is closed
         if sandbox:
             try:
-                sandbox.close()
-                print("[E2B] Sandbox closed")
+                sandbox.kill()
+                print("[E2B] Sandbox killed")
             except Exception as e:
-                print(f"[E2B] Error closing sandbox: {e}")
+                print(f"[E2B] Error killing sandbox: {e}")
 
         # Release semaphore
         if acquired:
