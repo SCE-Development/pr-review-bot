@@ -101,20 +101,22 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
         sandbox = Sandbox.create(template="claude", timeout=300)
         print("[E2B] Sandbox created")
 
-        # Upload agent.py to sandbox
-        with open('/app/agent.py', 'r') as f:
+        # Upload agent.mjs to sandbox
+        with open('/app/agent.mjs', 'r') as f:
             agent_code = f.read()
-        sandbox.files.write('/app/agent.py', agent_code)
-        print("[E2B] agent.py uploaded")
+        sandbox.files.write('/app/agent.mjs', agent_code)
+        print("[E2B] agent.mjs uploaded")
 
         # Write PR diff to a file to avoid env var size limits for large PRs
         sandbox.files.write('/app/pr.diff', pr_diff)
         print("[E2B] PR diff written to /app/pr.diff")
 
-        # Install dependencies in the sandbox
-        print("[E2B] Installing dependencies...")
-        sandbox.commands.run("pip3 install anthropic -q --break-system-packages", timeout=120)
-        print("[E2B] Dependencies installed")
+        # Write package.json and install Node dependencies
+        print("[E2B] Installing Node.js dependencies...")
+        package_json = '{"type":"module","dependencies":{"ai":"^4.0.0","@ai-sdk/anthropic":"^1.0.0","@ai-sdk/openai":"^1.0.0","@ai-sdk/google":"^1.0.0","zod":"^3.0.0"}}'
+        sandbox.files.write('/app/package.json', package_json)
+        sandbox.commands.run("cd /app && npm install -q", timeout=120)
+        print("[E2B] Node.js dependencies installed")
 
         # Run the agent with env vars passed directly to the command
         print("[E2B] Starting agent process...")
@@ -124,12 +126,15 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
             'BRANCH': branch_name,
             'GITHUB_TOKEN': token,
             'ANTHROPIC_API_KEY': os.environ.get("ANTHROPIC_API_KEY", ""),
+            'OPENAI_API_KEY': os.environ.get("OPENAI_API_KEY", ""),
+            'GOOGLE_API_KEY': os.environ.get("GOOGLE_API_KEY", ""),
             'MAX_TOOL_CALLS': os.environ.get("MAX_TOOL_CALLS", "10"),
+            'MODEL': os.environ.get("MODEL", "claude-haiku-4-5-20251001"),
         }
 
         stdout_chunks = []
         sandbox.commands.run(
-            "python3 /app/agent.py",
+            "node /app/agent.mjs",
             envs=agent_envs,
             timeout=290,
             on_stdout=lambda data: stdout_chunks.append(data),
