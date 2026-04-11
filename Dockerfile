@@ -1,6 +1,9 @@
 # Use Python 3.11 slim image
 FROM python:3.11-slim
 
+# Disable Python output buffering so logs appear immediately
+ENV PYTHONUNBUFFERED=1
+
 # Set working directory
 WORKDIR /app
 

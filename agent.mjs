@@ -1,7 +1,7 @@
-import { generateText, tool } from 'ai';
-import { createAnthropic } from '@ai-sdk/anthropic';
-import { createOpenAI } from '@ai-sdk/openai';
-import { createGoogleGenerativeAI } from '@ai-sdk/google';
+import { generateText, tool, stepCountIs } from 'ai';
+import { anthropic } from '@ai-sdk/anthropic';
+import { openai } from '@ai-sdk/openai';
+import { google } from '@ai-sdk/google';
 import { z } from 'zod';
 import { spawnSync } from 'child_process';
 import { readFileSync } from 'fs';
@@ -30,11 +30,20 @@ function runBash(command, timeout = 30000) {
   return output;
 }
 
-const SYSTEM_PROMPT = `You are a senior software engineer reviewing a pull request.
+const SYSTEM_PROMPT = `You are a senior software engineer doing a thorough review of a pull request.
 
-The repository is already cloned and your working directory is the repo root. You have a bash tool with full shell access — use it however you see fit to understand the changes and their impact.
+The repository is already cloned at the repo root. You have full bash access — use it liberally, there is no cost to running many commands.
 
-Return at most 3 findings as JSON — no other text. Each finding can be an inline comment (specific file + line) or an overall assessment (no file/line).
+You MUST do all of the following before forming any conclusions:
+1. Read each changed file in full, not just the diff
+2. Find every caller and usage of any modified function, class, or symbol across the entire repo
+3. Read related files — tests, configs, dependent modules, anything that could be affected
+4. Check for edge cases: error handling, concurrency, security, null/undefined, type mismatches
+5. Run any additional commands needed to fully understand the impact
+
+Use as many bash calls as you need. Do not cut corners.
+
+Only after thorough exploration, return at most 3 findings as JSON — no other text. Focus on real bugs, security issues, or broken logic. Skip style nits.
 
 {
   "findings": [
@@ -53,27 +62,24 @@ Return at most 3 findings as JSON — no other text. Each finding can be an inli
 
 If there are no significant issues, return {"findings": []}.`;
 
-function getModel(modelId, anthropicApiKey, openaiApiKey, googleApiKey) {
-  if (modelId.startsWith('gpt-') || modelId.startsWith('o1') || modelId.startsWith('o3')) {
-    return createOpenAI({ apiKey: openaiApiKey })(modelId);
+function getModel(modelId) {
+  if (modelId.startsWith('gpt-') || modelId.startsWith('o1') || modelId.startsWith('o3') || modelId.startsWith('o4')) {
+    return openai(modelId);
   }
   if (modelId.startsWith('gemini-')) {
-    return createGoogleGenerativeAI({ apiKey: googleApiKey })(modelId);
+    return google(modelId);
   }
-  return createAnthropic({ apiKey: anthropicApiKey })(modelId);
+  return anthropic(modelId);
 }
 
 async function main() {
   const repoName = process.env.REPO;
   const branchName = process.env.BRANCH || 'main';
-  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
-  const openaiApiKey = process.env.OPENAI_API_KEY || '';
-  const googleApiKey = process.env.GOOGLE_API_KEY || '';
   const githubToken = process.env.GITHUB_TOKEN;
   const maxSteps = parseInt(process.env.MAX_TOOL_CALLS || '10');
-  const modelId = process.env.MODEL || 'claude-haiku-4-5-20251001';
+  const modelId = process.env.MODEL || 'gemini-2.5-flash';
 
-  if (!repoName || !anthropicApiKey || !githubToken) {
+  if (!repoName || !githubToken) {
     console.log(JSON.stringify({ error: 'Missing required environment variables', findings: [] }));
     process.exit(0);
   }
@@ -109,24 +115,23 @@ async function main() {
     process.stderr.write(`Warning: Could not read PR diff (${e.message})\n`);
   }
 
-  process.stderr.write('Running agent...\n');
+  process.stderr.write(`Running agent with ${modelId}...\n`);
 
   try {
-    const model = getModel(modelId, anthropicApiKey, openaiApiKey, googleApiKey);
     let stepCount = 0;
 
     const { text } = await generateText({
-      model,
+      model: getModel(modelId),
       system: SYSTEM_PROMPT,
       prompt: `Please review this pull request:\n\n${prDiff}`,
-      maxSteps,
+      stopWhen: stepCountIs(maxSteps),
       tools: {
         bash: tool({
           description: 'Run a shell command in the repository root.',
-          parameters: z.object({ command: z.string() }),
+          inputSchema: z.object({ command: z.string() }),
           execute: async ({ command }) => {
             stepCount++;
-            process.stderr.write(`Tool call ${stepCount}/${maxSteps}: bash(${JSON.stringify({ command })})\n`);
+            process.stderr.write(`Tool call ${stepCount}: bash(${JSON.stringify({ command })})\n`);
             return runBash(command);
           },
         }),

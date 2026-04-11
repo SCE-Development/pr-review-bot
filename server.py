@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException
 import hmac
 import hashlib
 import os
@@ -70,6 +70,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
             pr_data = pr_response.json()
             commit_sha = pr_data["head"]["sha"]
             branch_name = pr_data["head"]["ref"]
+            head_repo = pr_data["head"]["repo"]["full_name"]
         except Exception as e:
             print(f"[E2B] Failed to fetch PR data: {e}")
             return
@@ -113,7 +114,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
 
         # Write package.json and install Node dependencies
         print("[E2B] Installing Node.js dependencies...")
-        package_json = '{"type":"module","dependencies":{"ai":"^4.0.0","@ai-sdk/anthropic":"^1.0.0","@ai-sdk/openai":"^1.0.0","@ai-sdk/google":"^1.0.0","zod":"^3.0.0"}}'
+        package_json = '{"type":"module","dependencies":{"ai":"^6.0.0","@ai-sdk/anthropic":"^3.0.0","@ai-sdk/openai":"^3.0.0","@ai-sdk/google":"^3.0.0","zod":"^3.23.0"}}'
         sandbox.files.write('/app/package.json', package_json)
         sandbox.commands.run("cd /app && npm install -q", timeout=120)
         print("[E2B] Node.js dependencies installed")
@@ -121,13 +122,13 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
         # Run the agent with env vars passed directly to the command
         print("[E2B] Starting agent process...")
         agent_envs = {
-            'REPO': repo,
+            'REPO': head_repo,
             'COMMIT_SHA': commit_sha,
             'BRANCH': branch_name,
             'GITHUB_TOKEN': token,
             'ANTHROPIC_API_KEY': os.environ.get("ANTHROPIC_API_KEY", ""),
             'OPENAI_API_KEY': os.environ.get("OPENAI_API_KEY", ""),
-            'GOOGLE_API_KEY': os.environ.get("GOOGLE_API_KEY", ""),
+            'GOOGLE_GENERATIVE_AI_API_KEY': os.environ.get("GOOGLE_GENERATIVE_AI_API_KEY", ""),
             'MAX_TOOL_CALLS': os.environ.get("MAX_TOOL_CALLS", "10"),
             'MODEL': os.environ.get("MODEL", "claude-haiku-4-5-20251001"),
         }
@@ -232,7 +233,7 @@ def run_review_in_e2b(repo: str, pr_number: int, installation_id: int):
         print("[E2B] Review task completed")
 
 @app.post('/webhook')
-async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
+async def webhook_handler(request: Request):
     # Verify signature
     signature = request.headers.get('X-Hub-Signature-256')
     body = await request.body()
@@ -242,20 +243,26 @@ async def webhook_handler(request: Request, background_tasks: BackgroundTasks):
 
     event = json.loads(body)
     action = event.get('action')
+    event_type = request.headers.get('X-GitHub-Event', 'unknown')
+    print(f"[Webhook] event={event_type} action={action}")
 
     # Only process PR open/update events
     if action in ['opened', 'reopened', 'synchronize']:
-        pr_number = event['pull_request']['number']
-        repo = event['pull_request']['base']['repo']['full_name']
-        installation_id = event['installation']['id']
+        try:
+            pr_number = event['pull_request']['number']
+            repo = event['pull_request']['base']['repo']['full_name']
+            installation_id = event['installation']['id']
+        except KeyError as e:
+            print(f"[Webhook] Missing key in payload: {e} — keys: {list(event.keys())}")
+            return {'status': 'ok'}
 
-        # Run review in E2B sandbox in background (don't block webhook response)
-        background_tasks.add_task(
-            run_review_in_e2b,
-            repo=repo,
-            pr_number=pr_number,
-            installation_id=installation_id
+        print(f"[Webhook] Scheduling review for PR #{pr_number} in {repo} (installation={installation_id})", flush=True)
+        thread = threading.Thread(
+            target=run_review_in_e2b,
+            kwargs={'repo': repo, 'pr_number': pr_number, 'installation_id': installation_id},
+            daemon=True
         )
+        thread.start()
 
     # Respond quickly (GitHub expects <30 sec)
     return {'status': 'ok'}
